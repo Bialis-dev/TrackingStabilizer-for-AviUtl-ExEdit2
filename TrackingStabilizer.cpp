@@ -13,8 +13,9 @@
 //   2. 補正したい映像オブジェクトのフィルタ効果に本プラグインを追加する
 //   3. 「追跡レイヤー1」に手順1の図形があるレイヤー番号(タイムライン表示の番号)を指定する
 //   4. 「基準フレーム」にブレが無い基準となるフレーム番号(通常は先頭フレーム)を指定する
-//   5. (任意) 回転ブレも補正したい場合は、別の特徴点をもう1つ追跡して図形を
-//      挿入し、「追跡レイヤー2」に指定したうえで「回転を補正する」をONにする
+//   5. (任意) 回転・拡縮ブレも補正したい場合は、別の特徴点をもう1つ追跡して
+//      図形を挿入し、「追跡レイヤー2」に指定したうえで「回転を補正する」/
+//      「拡縮を補正する」をON にする
 //
 //  仕組み(平行移動):
 //   get_output_image_param() を使って追跡レイヤーの図形オブジェクトの
@@ -30,6 +31,14 @@
 //   加算します。
 //    d_angle = atan2(点2.y - 点1.y, 点2.x - 点1.x)の現在フレームと基準フレームの差
 //    video->param->rz += -d_angle (度単位に変換)
+//
+//  仕組み(拡縮、v1.04):
+//   同じ2つの追跡点を使い、今度は角度ではなく「2点間の距離」の変化を見ます。
+//   現在フレームでの2点間距離が基準フレームより離れていれば「拡大して見えて
+//   いる」とみなし、その比率の逆数を video->param->sx / sy (拡大率、1.0=等倍)
+//   に掛け合わせることで、基準フレームの見た目の大きさに近づけます。
+//    ratio = 基準フレームの2点間距離 / 現在フレームの2点間距離
+//    video->param->sx *= ratio; video->param->sy *= ratio;
 //
 //  安全対策 (v1.01):
 //   「追跡レイヤー」に図形以外のオブジェクト(音声、空、テキストのみ等)が
@@ -98,11 +107,14 @@ auto fix_x         = FILTER_ITEM_CHECK(L"X軸を補正する", true);
 auto fix_y         = FILTER_ITEM_CHECK(L"Y軸を補正する", true);
 auto invert        = FILTER_ITEM_CHECK(L"移動量を反転して適用する", true);
 
-auto group_rotate   = FILTER_ITEM_GROUP(L"回転ブレ補正(任意)");
-auto fix_rotate     = FILTER_ITEM_CHECK(L"回転を補正する", false);
+auto group_rotate   = FILTER_ITEM_GROUP(L"回転・拡縮ブレ補正(任意)");
 auto track_layer2   = FILTER_ITEM_TRACK(L"追跡レイヤー2", 2.0, 1.0, 200.0, 1.0);
+auto fix_rotate     = FILTER_ITEM_CHECK(L"回転を補正する", false);
 auto rotate_strength = FILTER_ITEM_TRACK(L"回転補正強度(%)", 100.0, 0.0, 200.0, 1.0);
 auto rotate_invert  = FILTER_ITEM_CHECK(L"回転方向を反転する", false);
+auto fix_scale      = FILTER_ITEM_CHECK(L"拡縮を補正する", false);
+auto scale_strength = FILTER_ITEM_TRACK(L"拡縮補正強度(%)", 100.0, 0.0, 200.0, 1.0);
+auto scale_invert   = FILTER_ITEM_CHECK(L"拡縮方向を反転する", false);
 
 auto group_end     = FILTER_ITEM_GROUP(L"");
 
@@ -116,10 +128,13 @@ void* items[] = {
     &fix_y,
     &invert,
     &group_rotate,
-    &fix_rotate,
     &track_layer2,
+    &fix_rotate,
     &rotate_strength,
     &rotate_invert,
+    &fix_scale,
+    &scale_strength,
+    &scale_invert,
     &group_end,
     nullptr
 };
@@ -131,7 +146,7 @@ FILTER_PLUGIN_TABLE filter_plugin_table = {
     FILTER_PLUGIN_TABLE::FLAG_VIDEO | FILTER_PLUGIN_TABLE::FLAG_FILTER,   // 画像フィルタ + フィルタオブジェクト対応
     L"トラッキング手ブレ補正",                                             // プラグインの名前
     L"手ブレ補正",                                                         // ラベルの初期値
-    L"TrackingStabilizer version 1.03 - motion tracking based stabilizer",// プラグインの情報
+    L"TrackingStabilizer version 1.04 - motion tracking based stabilizer",// プラグインの情報
     items,                                                                 // 設定項目
     func_proc_video,                                                      // 画像フィルタ処理関数
 };
@@ -252,8 +267,8 @@ static bool try_stabilize(FILTER_PROC_VIDEO* video) {
         video->param->y += (float)(sign * k * dy);
     }
 
-    // ---- 回転ブレ補正(任意): 追跡レイヤー2が使える場合のみ ----
-    if (fix_rotate.value) {
+    // ---- 回転・拡縮ブレ補正(任意): 追跡レイヤー2が使える場合のみ ----
+    if (fix_rotate.value || fix_scale.value) {
         int layer2 = (int)std::lround(track_layer2.value) - 1;
         if (layer2 >= 0 && layer2 != layer1) {
             OBJECT_HANDLE track_obj2 = video->get_image_object(layer2, 0.0);
@@ -268,8 +283,12 @@ static bool try_stabilize(FILTER_PROC_VIDEO* video) {
                     double vx_base = base_param2.x - base_param1.x;
                     double vy_base = base_param2.y - base_param1.y;
 
-                    // 2点が重なっている(距離0)場合は角度が定まらないためスキップ
-                    if ((vx_cur != 0.0 || vy_cur != 0.0) && (vx_base != 0.0 || vy_base != 0.0)) {
+                    double dist_cur  = std::hypot(vx_cur,  vy_cur);
+                    double dist_base = std::hypot(vx_base, vy_base);
+
+                    // 回転補正: 2点が重なっている(距離0)場合は角度が定まらないためスキップ
+                    if (fix_rotate.value &&
+                        (vx_cur != 0.0 || vy_cur != 0.0) && (vx_base != 0.0 || vy_base != 0.0)) {
                         double angle_cur  = std::atan2(vy_cur,  vx_cur);
                         double angle_base = std::atan2(vy_base, vx_base);
                         double d_angle = angle_cur - angle_base;
@@ -280,18 +299,31 @@ static bool try_stabilize(FILTER_PROC_VIDEO* video) {
 
                         double d_angle_deg = d_angle * 180.0 / M_PI;
                         double rk = rotate_strength.value / 100.0;
-                        double rsign = rotate_invert.value ? -sign : sign;
-                        // 平行移動の補正 (video->param->x += sign*k*dx) と同じ考え方で、
-                        // 検出された回転ズレ(d_angle_deg)に符号を掛けて加算するだけで
-                        // 打ち消す方向になる想定(invert=true のとき既定でキャンセルする)。
-                        // 座標系の都合で向きが逆に見える場合は「回転方向を反転する」で調整する。
+                        // 注: 2点の角度差は「移動量を反転して適用する」(平行移動の生データの
+                        // 符号設定)の影響を受けない(両方の点が同じように反転されても角度の
+                        // 差分は変わらないため)。そのため回転の符号は独立させ、
+                        // 「回転方向を反転する」だけで調整する。
+                        double rsign = rotate_invert.value ? -1.0 : 1.0;
                         video->param->rz += (float)(rsign * rk * d_angle_deg);
                     }
+
+                    // 拡縮補正: 2点間の距離の変化から、基準フレームに対する拡大率を求める
+                    if (fix_scale.value && dist_cur > 1e-6 && dist_base > 1e-6) {
+                        // ratio<1 なら現在の方が2点間が離れている(=拡大して見えている)ので
+                        // 画像を縮めて基準フレームの見た目に近づける、という向きになる。
+                        double ratio = scale_invert.value ? (dist_cur / dist_base) : (dist_base / dist_cur);
+                        double sk = scale_strength.value / 100.0;
+                        double factor = 1.0 + (ratio - 1.0) * sk;
+                        if (factor > 0.01) { // 0以下・極端な値による破綻を防止
+                            video->param->sx *= (float)factor;
+                            video->param->sy *= (float)factor;
+                        }
+                    }
                 } else {
-                    log_warn_once(L"[トラッキング手ブレ補正] 追跡レイヤー2のオブジェクトから座標を取得できません。回転補正をスキップしました。");
+                    log_warn_once(L"[トラッキング手ブレ補正] 追跡レイヤー2のオブジェクトから座標を取得できません。回転・拡縮補正をスキップしました。");
                 }
             } else {
-                log_warn_once(L"[トラッキング手ブレ補正] 追跡レイヤー2に図形オブジェクトが見つかりません。回転補正をスキップしました。");
+                log_warn_once(L"[トラッキング手ブレ補正] 追跡レイヤー2に図形オブジェクトが見つかりません。回転・拡縮補正をスキップしました。");
             }
         }
     }

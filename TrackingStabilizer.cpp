@@ -40,6 +40,24 @@
 //    ratio = 基準フレームの2点間距離 / 現在フレームの2点間距離
 //    video->param->sx *= ratio; video->param->sy *= ratio;
 //
+//  回転・拡縮の中心ズレ補正 (v1.05):
+//   v1.04までは、平行移動(x,y)の補正と回転・拡縮(rz,sx,sy)の補正をそれぞれ
+//   独立に計算して加算/乗算していました。しかしAviUtl2の回転・拡縮は
+//   「オブジェクト自身の中心点」を軸に行われるため、素直に rz / sx,sy を
+//   加算・乗算するだけだと、せっかく平行移動で固定したはずの追跡レイヤー1の
+//   点が、その中心の周りに引きずられて動いてしまい、回転・拡縮をONにすると
+//   逆にブレが悪化して見えることがありました。
+//   これを解消するため、以下の手順で平行移動量を計算し直しています。
+//    1. オブジェクト自身の中心座標 C (=own_param.x+cx, y+cy) を取得する
+//    2. C を軸に (theta_applied, scale_applied) を適用した場合、追跡レイヤー1の
+//       点が現在の位置からどこへ移動するか (p1_after) を三角関数で計算する
+//    3. 「平行移動のみ補正した場合の目標位置」(p1_target) との差分を、最終的な
+//       平行移動量として使う
+//        final_dx,dy = p1_target - p1_after
+//   この結果、回転・拡縮の強度に関わらず、追跡レイヤー1の点は常に正しい目標
+//   位置に来るように補正されます(回転・拡縮がOFFのときは従来通りの単純な
+//   平行移動補正と一致します)。
+//
 //  安全対策 (v1.01):
 //   「追跡レイヤー」に図形以外のオブジェクト(音声、空、テキストのみ等)が
 //   置かれていると、AviUtl2本体側の座標取得処理が失敗/例外を投げることがあり、
@@ -110,11 +128,11 @@ auto invert        = FILTER_ITEM_CHECK(L"移動量を反転して適用する", 
 auto group_rotate   = FILTER_ITEM_GROUP(L"回転・拡縮ブレ補正(任意)");
 auto track_layer2   = FILTER_ITEM_TRACK(L"追跡レイヤー2", 2.0, 1.0, 200.0, 1.0);
 auto fix_rotate     = FILTER_ITEM_CHECK(L"回転を補正する", false);
-auto rotate_strength = FILTER_ITEM_TRACK(L"回転補正強度(%)", 100.0, 0.0, 200.0, 1.0);
-auto rotate_invert  = FILTER_ITEM_CHECK(L"回転方向を反転する", false);
+auto rotate_invert  = FILTER_ITEM_CHECK(L"回転を反対にする", false);
 auto fix_scale      = FILTER_ITEM_CHECK(L"拡縮を補正する", false);
+auto scale_invert   = FILTER_ITEM_CHECK(L"拡縮を反転する", false);
+auto rotate_strength = FILTER_ITEM_TRACK(L"回転補正強度(%)", 100.0, 0.0, 200.0, 1.0);
 auto scale_strength = FILTER_ITEM_TRACK(L"拡縮補正強度(%)", 100.0, 0.0, 200.0, 1.0);
-auto scale_invert   = FILTER_ITEM_CHECK(L"拡縮方向を反転する", false);
 
 auto group_end     = FILTER_ITEM_GROUP(L"");
 
@@ -130,11 +148,11 @@ void* items[] = {
     &group_rotate,
     &track_layer2,
     &fix_rotate,
-    &rotate_strength,
     &rotate_invert,
     &fix_scale,
-    &scale_strength,
     &scale_invert,
+    &rotate_strength,
+    &scale_strength,
     &group_end,
     nullptr
 };
@@ -146,7 +164,7 @@ FILTER_PLUGIN_TABLE filter_plugin_table = {
     FILTER_PLUGIN_TABLE::FLAG_VIDEO | FILTER_PLUGIN_TABLE::FLAG_FILTER,   // 画像フィルタ + フィルタオブジェクト対応
     L"トラッキング手ブレ補正",                                             // プラグインの名前
     L"手ブレ補正",                                                         // ラベルの初期値
-    L"TrackingStabilizer version 1.04 - motion tracking based stabilizer",// プラグインの情報
+    L"TrackingStabilizer version 1.05 - motion tracking based stabilizer",// プラグインの情報
     items,                                                                 // 設定項目
     func_proc_video,                                                      // 画像フィルタ処理関数
 };
@@ -260,15 +278,45 @@ static bool try_stabilize(FILTER_PROC_VIDEO* video) {
     double sign = invert.value ? -1.0 : 1.0;
     double k    = strength.value / 100.0;
 
-    if (fix_x.value) {
-        video->param->x += (float)(sign * k * dx);
-    }
-    if (fix_y.value) {
-        video->param->y += (float)(sign * k * dy);
-    }
+    // レイヤー1の点を「補正後に本来あるべき位置」(平行移動の補正だけをかけた
+    // 場合の目標位置)。回転・拡縮を後から加えても、最終的にレイヤー1の点が
+    // ここに来るように平行移動量を逆算する。
+    double p1_target_x = cur_param1.x + sign * k * dx;
+    double p1_target_y = cur_param1.y + sign * k * dy;
 
     // ---- 回転・拡縮ブレ補正(任意): 追跡レイヤー2が使える場合のみ ----
-    if (fix_rotate.value || fix_scale.value) {
+    // AviUtl2は回転・拡縮を「このオブジェクト自身の中心点」を軸に行うため、
+    // 何も考えずに rz / sx,sy を加算・乗算するだけだと、レイヤー1の追跡点が
+    // その中心の周りに引きずられて動いてしまい、平行移動の補正と噛み合わなく
+    // なる(せっかく固定したはずのレイヤー1の点がズレてしまう)。
+    // これを防ぐため、
+    //   1. 自オブジェクト自身の現在の中心座標 C を取得する
+    //   2. 回転・拡縮を C を軸に適用した場合、レイヤー1の点がどこに移動するかを計算する
+    //   3. その移動先が p1_target (上で決めた本来の目標位置) に一致するよう、
+    //      平行移動量を通常の dx,dy 補正から補い直す
+    // という手順で、回転・拡縮をONにしてもレイヤー1の点が正しい位置に来るように
+    // しています。
+    double theta_applied = 0.0; // ラジアン、実際に適用する回転量(強度・反転を反映済み)
+    double scale_applied = 1.0; // 実際に適用する拡大率(強度・反転を反映済み)
+
+    bool need_pivot = fix_rotate.value || fix_scale.value;
+    bool own_ok = false;
+    double Cx = cur_param1.x, Cy = cur_param1.y; // 取得できない場合のフォールバック
+
+    if (need_pivot && video->get_output_image_param) {
+        OBJECT_IMAGE_PARAM own_param{};
+        // nullptrを指定すると「このフィルタが処理している現在のオブジェクト自身」の
+        // (このフィルタで変更する前の)画像パラメータが取得出来る
+        if (video->get_output_image_param(nullptr, 0.0, &own_param, sizeof(own_param))) {
+            Cx = own_param.x + own_param.cx;
+            Cy = own_param.y + own_param.cy;
+            own_ok = true;
+        } else {
+            log_warn_once(L"[トラッキング手ブレ補正] 自オブジェクトの中心座標を取得できないため、回転・拡縮ブレ補正をスキップしました。");
+        }
+    }
+
+    if (need_pivot && own_ok) {
         int layer2 = (int)std::lround(track_layer2.value) - 1;
         if (layer2 >= 0 && layer2 != layer1) {
             OBJECT_HANDLE track_obj2 = video->get_image_object(layer2, 0.0);
@@ -297,14 +345,13 @@ static bool try_stabilize(FILTER_PROC_VIDEO* video) {
                         while (d_angle > M_PI)  d_angle -= 2.0 * M_PI;
                         while (d_angle < -M_PI) d_angle += 2.0 * M_PI;
 
-                        double d_angle_deg = d_angle * 180.0 / M_PI;
                         double rk = rotate_strength.value / 100.0;
                         // 注: 2点の角度差は「移動量を反転して適用する」(平行移動の生データの
                         // 符号設定)の影響を受けない(両方の点が同じように反転されても角度の
                         // 差分は変わらないため)。そのため回転の符号は独立させ、
-                        // 「回転方向を反転する」だけで調整する。
+                        // 「回転を反対にする」だけで調整する。
                         double rsign = rotate_invert.value ? -1.0 : 1.0;
-                        video->param->rz += (float)(rsign * rk * d_angle_deg);
+                        theta_applied = rsign * rk * d_angle;
                     }
 
                     // 拡縮補正: 2点間の距離の変化から、基準フレームに対する拡大率を求める
@@ -315,8 +362,7 @@ static bool try_stabilize(FILTER_PROC_VIDEO* video) {
                         double sk = scale_strength.value / 100.0;
                         double factor = 1.0 + (ratio - 1.0) * sk;
                         if (factor > 0.01) { // 0以下・極端な値による破綻を防止
-                            video->param->sx *= (float)factor;
-                            video->param->sy *= (float)factor;
+                            scale_applied = factor;
                         }
                     }
                 } else {
@@ -326,6 +372,34 @@ static bool try_stabilize(FILTER_PROC_VIDEO* video) {
                 log_warn_once(L"[トラッキング手ブレ補正] 追跡レイヤー2に図形オブジェクトが見つかりません。回転・拡縮補正をスキップしました。");
             }
         }
+    }
+
+    // 回転・拡縮を実際に適用(theta_applied=0, scale_applied=1のときは無変化)
+    video->param->rz += (float)(theta_applied * 180.0 / M_PI);
+    video->param->sx *= (float)scale_applied;
+    video->param->sy *= (float)scale_applied;
+
+    // 中心Cを軸に(theta_applied, scale_applied)を適用した場合、レイヤー1の点が
+    // どこへ移動するかを計算する
+    double relx = cur_param1.x - Cx;
+    double rely = cur_param1.y - Cy;
+    double cosT = std::cos(theta_applied);
+    double sinT = std::sin(theta_applied);
+    double p1_after_x = Cx + scale_applied * (relx * cosT - rely * sinT);
+    double p1_after_y = Cy + scale_applied * (relx * sinT + rely * cosT);
+
+    // その移動先が p1_target に一致するように、平行移動量を補う
+    double final_dx = p1_target_x - p1_after_x;
+    double final_dy = p1_target_y - p1_after_y;
+
+    // (theta_applied=0, scale_applied=1のときは p1_after == cur_param1 になるため、
+    //  final_dx,dy は sign*k*dx,dy と一致し、従来通りの単純な平行移動補正に戻る)
+
+    if (fix_x.value) {
+        video->param->x += (float)final_dx;
+    }
+    if (fix_y.value) {
+        video->param->y += (float)final_dy;
     }
 
     // 正常に補正できたので、次に失敗した時にまた警告できるようにフラグを戻す

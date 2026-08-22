@@ -30,6 +30,8 @@ AviUtl ExEdit2 向けの手ブレ補正(スタビライズ)フィルタ効果プ
 
 ## ダウンロード
 
+AviUtil2カタログからのダウンロードが便利でおすすめです。[ダウンロードページはこちら](https://aviutl2-catalog-badge.sevenc7c.workers.dev/package/Bialis.TrackingStabilizer-for-AviUtl-ExEdit2)
+
 ビルド済みの `TrackingStabilizer.auf2` は [Releases](../../releases) から
 ダウンロードできます。`.auf2` ファイルを AviUtl ExEdit2 のプレビュー画面へ
 ドラッグ&ドロップすればインストールできます。
